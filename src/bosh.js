@@ -6,10 +6,21 @@
 */
 
 /* jshint undef: true, unused: true:, noarg: true, latedef: true */
-/*global window, setTimeout, clearTimeout,
-    XMLHttpRequest, ActiveXObject,
-    Strophe, $build */
+/* global define, window, setTimeout, clearTimeout, XMLHttpRequest, ActiveXObject, Strophe, $build */
 
+(function (root, factory) {
+    if (typeof define === 'function' && define.amd) {
+        define('strophe-bosh', ['strophe-core'], function (core) {
+            return factory(
+                core.Strophe,
+                core.$build
+            );
+        });
+    } else {
+        // Browser globals
+        return factory(Strophe, $build);
+    }
+}(this, function (Strophe, $build) {
 
 /** PrivateClass: Strophe.Request
  *  _Private_ helper class that provides a cross implementation abstraction
@@ -186,11 +197,12 @@ Strophe.Bosh.prototype = {
             rid: this.rid++,
             xmlns: Strophe.NS.HTTPBIND
         });
-
         if (this.sid !== null) {
             bodyWrap.attrs({sid: this.sid});
         }
-
+        if (this._conn.options.keepalive) {
+            this._cacheSession();
+        }
         return bodyWrap;
     },
 
@@ -204,6 +216,7 @@ Strophe.Bosh.prototype = {
         this.rid = Math.floor(Math.random() * 4294967295);
         this.sid = null;
         this.errors = 0;
+        window.sessionStorage.removeItem('strophe-bosh-session');
     },
 
     /** PrivateFunction: _connect
@@ -289,6 +302,64 @@ Strophe.Bosh.prototype = {
         this._conn._changeConnectStatus(Strophe.Status.ATTACHED, null);
     },
 
+    /** PrivateFunction: _restore
+     *  Attempt to restore a cached BOSH session
+     *
+     *  Parameters:
+     *    (String) jid - The full JID that is bound by the session.
+     *      This parameter is optional but recommended, specifically in cases
+     *      where prebinded BOSH sessions are used where it's important to know
+     *      that the right session is being restored.
+     *    (Function) callback The connect callback function.
+     *    (Integer) wait - The optional HTTPBIND wait value.  This is the
+     *      time the server will wait before returning an empty result for
+     *      a request.  The default setting of 60 seconds is recommended.
+     *      Other settings will require tweaks to the Strophe.TIMEOUT value.
+     *    (Integer) hold - The optional HTTPBIND hold value.  This is the
+     *      number of connections the server will hold at one time.  This
+     *      should almost always be set to 1 (the default).
+     *    (Integer) wind - The optional HTTBIND window value.  This is the
+     *      allowed range of request ids that are valid.  The default is 5.
+     */
+    _restore: function (jid, callback, wait, hold, wind)
+    {
+        var session = JSON.parse(window.sessionStorage.getItem('strophe-bosh-session'));
+        if (typeof session !== "undefined" &&
+                   session !== null &&
+                   session.rid &&
+                   session.sid &&
+                   session.jid &&
+                   (typeof jid === "undefined" || jid === "null" || Strophe.getBareJidFromJid(session.jid) == Strophe.getBareJidFromJid(jid)))
+        {
+            this._conn.restored = true;
+            this._attach(session.jid, session.sid, session.rid, callback, wait, hold, wind);
+        } else {
+            throw { name: "StropheSessionError", message: "_restore: no restoreable session." };
+        }
+    },
+
+    /** PrivateFunction: _cacheSession
+     *  _Private_ handler for the beforeunload event.
+     *
+     *  This handler is used to process the Bosh-part of the initial request.
+     *  Parameters:
+     *    (Strophe.Request) bodyWrap - The received stanza.
+     */
+    _cacheSession: function ()
+    {
+        if (this._conn.authenticated) {
+            if (this._conn.jid && this.rid && this.sid) {
+                window.sessionStorage.setItem('strophe-bosh-session', JSON.stringify({
+                    'jid': this._conn.jid,
+                    'rid': this.rid,
+                    'sid': this.sid
+                }));
+            }
+        } else {
+            window.sessionStorage.removeItem('strophe-bosh-session');
+        }
+    },
+
     /** PrivateFunction: _connect_cb
      *  _Private_ handler for initial connection request.
      *
@@ -302,8 +373,8 @@ Strophe.Bosh.prototype = {
         var cond, conflict;
         if (typ !== null && typ == "terminate") {
             // an error occurred
-            Strophe.error("BOSH-Connection failed: " + cond);
             cond = bodyWrap.getAttribute("condition");
+            Strophe.error("BOSH-Connection failed: " + cond);
             conflict = bodyWrap.getElementsByTagName("conflict");
             if (cond !== null) {
                 if (cond == "remote-stream-error" && conflict.length > 0) {
@@ -313,7 +384,7 @@ Strophe.Bosh.prototype = {
             } else {
                 this._conn._changeConnectStatus(Strophe.Status.CONNFAIL, "unknown");
             }
-            this._conn._doDisconnect();
+            this._conn._doDisconnect(cond);
             return Strophe.Status.CONNFAIL;
         }
 
@@ -350,6 +421,7 @@ Strophe.Bosh.prototype = {
     {
         this.sid = null;
         this.rid = Math.floor(Math.random() * 4294967295);
+        window.sessionStorage.removeItem('strophe-bosh-session');
     },
 
     /** PrivateFunction: _emptyQueue
@@ -409,8 +481,14 @@ Strophe.Bosh.prototype = {
      *
      *  Cancels all remaining Requests and clears the queue.
      */
-    _onDisconnectTimeout: function ()
-    {
+    _onDisconnectTimeout: function () {
+        this._abortAllRequests();
+    },
+
+    /** PrivateFunction: _abortAllRequests
+     *  _Private_ helper function that makes sure all pending requests are aborted.
+     */
+    _abortAllRequests: function _abortAllRequests() {
         var req;
         while (this._requests.length > 0) {
             req = this._requests.pop();
@@ -465,7 +543,7 @@ Strophe.Bosh.prototype = {
                                     this._onRequestStateChange.bind(
                                         this, this._conn._dataRecv.bind(this._conn)),
                                     body.tree().getAttribute("rid")));
-            this._processRequest(this._requests.length - 1);
+            this._throttledRequestHandler();
         }
 
         if (this._requests.length > 0) {
@@ -570,8 +648,7 @@ Strophe.Bosh.prototype = {
                     reqStatus >= 12000) {
                     this._hitError(reqStatus);
                     if (reqStatus >= 400 && reqStatus < 500) {
-                        this._conn._changeConnectStatus(Strophe.Status.DISCONNECTING,
-                                                  null);
+                        this._conn._changeConnectStatus(Strophe.Status.DISCONNECTING, null);
                         this._conn._doDisconnect();
                     }
                 }
@@ -847,3 +924,5 @@ Strophe.Bosh.prototype = {
         }
     }
 };
+return Strophe;
+}));
